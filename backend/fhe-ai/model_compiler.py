@@ -5,7 +5,7 @@ class FheModelCompiler:
     def __init__(self, precision_bits: int = 16):
         self.precision_bits = precision_bits
         self.quant_factor = 2 ** precision_bits
-        print("TITLE")
+        
 
     def compile_linear_weights(self, weights: list, bias: float):
         quantized_weights = [int(w * self.quant_factor) for w in weights]
