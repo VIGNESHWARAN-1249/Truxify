@@ -4,16 +4,13 @@ import deadLetterRepository from '../repositories/deadLetter.repository.js';
 import orderReadModel from '../cqrs/order.read.model.js';
 import logger from '../../api/src/middleware/logger.js';
 
-// Topics whose only side effect is the order read-model projection. These are
-// applied ATOMICALLY with their idempotency record (apply_order_event), so a
-// duplicate/replayed message is a no-op and an event is never marked processed
-// before its read-model update succeeds.
 const ORDER_READ_MODEL_TOPICS = new Set([
   TOPICS.ORDER_CREATED,
   TOPICS.ORDER_UPDATED,
   TOPICS.ORDER_CANCELLED,
   TOPICS.DRIVER_ASSIGNED,
 ]);
+
 const MAX_REPLAY_ATTEMPTS = 3;
 
 class OrderConsumer {
@@ -28,46 +25,88 @@ class OrderConsumer {
     this._eventBus = eventBus;
   }
 
+  /**
+   * Get event ID consistently everywhere.
+   *
+   * Priority:
+   * 1. metadata.eventId
+   * 2. top-level eventId
+   * 3. Kafka message key
+   */
+  getEventId(message, rawMessage = null) {
+    return (
+      message?.metadata?.eventId ||
+      message?.eventId ||
+      rawMessage?.key?.toString() ||
+      null
+    );
+  }
+
+  /**
+   * Get order ID consistently everywhere.
+   */
+  getOrderId(message, rawMessage = null) {
+    return (
+      message?.aggregateId ||
+      message?.orderId ||
+      message?.payload?.orderId ||
+      rawMessage?.key?.toString() ||
+      null
+    );
+  }
+
   async initialize() {
     if (this.initialized) return;
 
-    await kafka.createConsumer(CONSUMER_GROUPS.ORDER_SERVICE, [
-      TOPICS.ORDER_CREATED,
-      TOPICS.ORDER_UPDATED,
-      TOPICS.ORDER_CANCELLED,
-      TOPICS.DRIVER_ASSIGNED,
-      TOPICS.PAYMENT_CONFIRMED,
-      TOPICS.TRIP_STARTED,
-      TOPICS.TRIP_COMPLETED,
-      TOPICS.ESCROW_CREATED,
-      TOPICS.ESCROW_RELEASED,
-    ]);
+    await kafka.createConsumer(
+      CONSUMER_GROUPS.ORDER_SERVICE,
+      [
+        TOPICS.ORDER_CREATED,
+        TOPICS.ORDER_UPDATED,
+        TOPICS.ORDER_CANCELLED,
+        TOPICS.DRIVER_ASSIGNED,
+        TOPICS.PAYMENT_CONFIRMED,
+        TOPICS.TRIP_STARTED,
+        TOPICS.TRIP_COMPLETED,
+        TOPICS.ESCROW_CREATED,
+        TOPICS.ESCROW_RELEASED,
+      ]
+    );
 
-    await kafka.createConsumer(CONSUMER_GROUPS.NOTIFICATION_SERVICE, [
-      TOPICS.ORDER_CREATED,
-      TOPICS.DRIVER_ASSIGNED,
-      TOPICS.PAYMENT_CONFIRMED,
-      TOPICS.ESCROW_RELEASED,
-      TOPICS.NOTIFICATION_SENT,
-    ]);
+    await kafka.createConsumer(
+      CONSUMER_GROUPS.NOTIFICATION_SERVICE,
+      [
+        TOPICS.ORDER_CREATED,
+        TOPICS.DRIVER_ASSIGNED,
+        TOPICS.PAYMENT_CONFIRMED,
+        TOPICS.ESCROW_RELEASED,
+        TOPICS.NOTIFICATION_SENT,
+      ]
+    );
 
-    await kafka.createConsumer(CONSUMER_GROUPS.ANALYTICS_SERVICE, [
-      TOPICS.ORDER_CREATED,
-      TOPICS.ORDER_UPDATED,
-      TOPICS.ORDER_CANCELLED,
-      TOPICS.DRIVER_ASSIGNED,
-      TOPICS.PAYMENT_CONFIRMED,
-      TOPICS.TRIP_STARTED,
-      TOPICS.TRIP_COMPLETED,
-      TOPICS.ETA_UPDATED,
-      TOPICS.LOCATION_UPDATED,
-    ]);
+    await kafka.createConsumer(
+      CONSUMER_GROUPS.ANALYTICS_SERVICE,
+      [
+        TOPICS.ORDER_CREATED,
+        TOPICS.ORDER_UPDATED,
+        TOPICS.ORDER_CANCELLED,
+        TOPICS.DRIVER_ASSIGNED,
+        TOPICS.PAYMENT_CONFIRMED,
+        TOPICS.TRIP_STARTED,
+        TOPICS.TRIP_COMPLETED,
+        TOPICS.ETA_UPDATED,
+        TOPICS.LOCATION_UPDATED,
+      ]
+    );
 
-    await kafka.createConsumer(CONSUMER_GROUPS.FRAUD_SERVICE, [
-      TOPICS.ORDER_CREATED,
-      TOPICS.PAYMENT_CONFIRMED,
-      TOPICS.FRAUD_DETECTED,
-    ]);
+    await kafka.createConsumer(
+      CONSUMER_GROUPS.FRAUD_SERVICE,
+      [
+        TOPICS.ORDER_CREATED,
+        TOPICS.PAYMENT_CONFIRMED,
+        TOPICS.FRAUD_DETECTED,
+      ]
+    );
 
     this.createdConsumerGroups = [
       CONSUMER_GROUPS.ORDER_SERVICE,
@@ -77,6 +116,7 @@ class OrderConsumer {
     ];
 
     this.initialized = true;
+
     logger.info('✅ Kafka consumers initialized');
   }
 
@@ -84,362 +124,765 @@ class OrderConsumer {
     if (!this.handlers.has(topic)) {
       this.handlers.set(topic, []);
     }
+
     this.handlers.get(topic).push(handler);
   }
 
   registerHandlerViaEventBus(eventType, handler) {
     if (this._eventBus) {
       this._eventBus.subscribe(eventType, handler);
-      logger.info(`[OrderConsumer] Registered EventBus handler for "${eventType}"`);
+
+      logger.info(
+        `[OrderConsumer] Registered EventBus handler for "${eventType}"`
+      );
     } else {
-      logger.warn('[OrderConsumer] No EventBus set, falling back to direct handler registration');
+      logger.warn(
+        '[OrderConsumer] No EventBus set, falling back to direct handler registration'
+      );
+
       this.registerHandler(eventType, handler);
     }
   }
 
-  async startConsuming(groupId) {
-    const consumer = await kafka.getConsumer(groupId);
-    const handlers = this.handlers;
+  /**
+   * Safely persist a dead-letter record.
+   *
+   * DLQ persistence itself must not crash the consumer.
+   */
+  async safeStoreDeadLetter(topic, rawMessage, error) {
+    try {
+      await this.storeDeadLetter(topic, rawMessage, error);
+    } catch (dlqError) {
+      logger.error(
+        `❌ Failed to persist dead letter for ${topic}:`,
+        dlqError
+      );
+    }
+  }
 
-    const messageHandler = async (topic, message, rawMessage) => {
-      // Set when a side-effect topic claims the event for two-phase
-      // processing; used below to flip the claim to completed/failed.
-      let claimedEventId = null;
+  /**
+   * Publish to EventBus.
+   *
+   * Always preserve the original event object when possible so
+   * event-id based deduplication can work consistently.
+   */
+  async publishToEventBus(topic, message, groupId) {
+    if (!this._eventBus) {
+      return;
+    }
 
-      // Order read-model topics: apply the event atomically with its
-      // idempotency record. If the event was already applied (duplicate,
-      // redelivery after a restart, replay, or a publish retried after a
-      // crash), applyEvent returns false and we skip all side effects.
-      if (ORDER_READ_MODEL_TOPICS.has(topic)) {
-        const eventId = message?.eventId || message?.metadata?.eventId || rawMessage?.key?.toString() || null;
-        const orderId = message?.aggregateId || message?.orderId || message?.payload?.orderId || rawMessage?.key?.toString() || null;
+    const eventType = topic
+      .replace(/\./g, '_')
+      .toUpperCase();
 
-        const applied = await orderReadModel.applyEvent({
+    if (
+      message &&
+      typeof message === 'object'
+    ) {
+      await this._eventBus.publish(
+        message,
+        {
+          adapters: [],
+          source: `kafka:${groupId}`,
+        }
+      );
+    } else {
+      await this._eventBus.publish(
+        eventType,
+        message,
+        {
+          adapters: [],
+          source: `kafka:${groupId}`,
+        }
+      );
+    }
+  }
+
+  /**
+   * Execute normal registered handlers.
+   */
+  async executeHandlers(topic, message, rawMessage) {
+    const topicHandlers = this.handlers.get(topic) || [];
+
+    for (const handler of topicHandlers) {
+      await handler(message, rawMessage);
+    }
+  }
+
+  /**
+   * Apply order read model.
+   *
+   * Returns false when the event was already applied.
+   */
+  async applyOrderReadModel(
+    topic,
+    message,
+    rawMessage,
+    groupId
+  ) {
+    const eventId = this.getEventId(
+      message,
+      rawMessage
+    );
+
+    const orderId = this.getOrderId(
+      message,
+      rawMessage
+    );
+
+    return orderReadModel.applyEvent({
+      topic,
+      eventId,
+      orderId,
+      eventType: message?.eventType,
+      payload: message?.payload,
+      version: message?.version,
+      consumerGroup: groupId,
+    });
+  }
+
+  /**
+   * Process an incoming Kafka message.
+   *
+   * This is the single source of truth for processing behavior.
+   */
+  async processMessage(
+    topic,
+    message,
+    rawMessage,
+    groupId
+  ) {
+    const isReadModelTopic =
+      ORDER_READ_MODEL_TOPICS.has(topic);
+
+    /**
+     * READ MODEL
+     *
+     * Projection is atomically idempotent.
+     */
+    if (isReadModelTopic) {
+      const eventId = this.getEventId(
+        message,
+        rawMessage
+      );
+
+      try {
+        const applied =
+          await this.applyOrderReadModel(
+            topic,
+            message,
+            rawMessage,
+            groupId
+          );
+
+        if (!applied) {
+          logger.info(
+            `[OrderConsumer] Duplicate read-model event ${eventId} on ${topic}; skipping`
+          );
+        }
+
+        /**
+         * Important:
+         *
+         * These topics are projection-only topics.
+         * We intentionally do NOT execute side-effect handlers here.
+         *
+         * This keeps live processing and replay behavior identical.
+         */
+        return {
+          success: true,
+          skipped: !applied,
+          eventId,
+        };
+      } catch (error) {
+        logger.error(
+          `Read-model processing failed for ${topic}:`,
+          error
+        );
+
+        await this.safeStoreDeadLetter(
+          topic,
+          rawMessage,
+          error
+        );
+
+        return {
+          success: false,
+          eventId,
+          error,
+        };
+      }
+    }
+
+    /**
+     * SIDE-EFFECT TOPICS
+     */
+    const eventId = this.getEventId(
+      message,
+      rawMessage
+    );
+
+    const orderId = this.getOrderId(
+      message,
+      rawMessage
+    );
+
+    /**
+     * A side-effect event without an ID cannot be safely
+     * deduplicated.
+     */
+    if (!eventId) {
+      const error = new Error(
+        `Missing eventId for side-effect topic ${topic}`
+      );
+
+      logger.error(
+        `[OrderConsumer] ${error.message}`
+      );
+
+      await this.safeStoreDeadLetter(
+        topic,
+        rawMessage,
+        error
+      );
+
+      return {
+        success: false,
+        eventId: null,
+        error,
+      };
+    }
+
+    let claimed = false;
+
+    try {
+      /**
+       * Atomically claim the event.
+       */
+      claimed =
+        await processedEventRepository.claimProcessing(
           topic,
           eventId,
           orderId,
-          eventType: message?.eventType,
-          payload: message?.payload,
-          version: message?.version,
-          consumerGroup: groupId,
-        });
+          groupId
+        );
 
-        if (!applied) {
-          logger.info(`[OrderConsumer] Skipping duplicate event ${eventId} on ${topic}`, { orderId });
-          return;
-        }
-      } else {
-        // Side-effect topics (wallet credits, notifications, ...): claim the
-        // event as 'processing' BEFORE running handlers so a redelivery can
-        // never apply the same side effect twice concurrently, then flip the
-        // claim to 'completed' only after the handlers succeed (issue #11192).
-        // A failed handler flips it to 'failed' so a later delivery can
-        // re-claim and retry the event instead of losing the side effect.
-        const eventId = message?.metadata?.eventId || rawMessage?.key?.toString() || null;
-        claimedEventId = eventId;
-        if (eventId) {
-          const isNew = await processedEventRepository.claimProcessing(
+      if (!claimed) {
+        logger.info(
+          `[OrderConsumer] Duplicate/active event ${eventId} on ${topic}; skipping`
+        );
+
+        return {
+          success: true,
+          skipped: true,
+          eventId,
+        };
+      }
+
+      /**
+       * Execute direct handlers.
+       */
+      await this.executeHandlers(
+        topic,
+        message,
+        rawMessage
+      );
+
+      /**
+       * Execute EventBus fan-out.
+       *
+       * If this fails, the whole event remains retryable.
+       */
+      await this.publishToEventBus(
+        topic,
+        message,
+        groupId
+      );
+
+      /**
+       * Only mark completed after ALL side effects succeed.
+       */
+      const completed =
+        await processedEventRepository.markCompleted(
+          topic,
+          eventId,
+          groupId
+        );
+
+      if (completed === false) {
+        logger.warn(
+          `[OrderConsumer] Event ${eventId} on ${topic} was not completed because its claim expired or was superseded`
+        );
+
+        return {
+          success: false,
+          eventId,
+        };
+      }
+
+      return {
+        success: true,
+        eventId,
+      };
+    } catch (error) {
+      logger.error(
+        `❌ Processing failed for ${topic}, event ${eventId}:`,
+        error
+      );
+
+      await this.safeStoreDeadLetter(
+        topic,
+        rawMessage,
+        error
+      );
+
+      /**
+       * Only the worker that successfully claimed the event
+       * should transition it to failed.
+       */
+      if (claimed) {
+        try {
+          await processedEventRepository.markFailed(
             topic,
             eventId,
-            message?.orderId || message?.payload?.orderId || null,
             groupId
           );
-          if (!isNew) {
-            logger.info(`[OrderConsumer] Skipping duplicate event ${eventId} on ${topic}`);
-            return;
-          }
+        } catch (statusError) {
+          logger.error(
+            `[OrderConsumer] Failed to mark event ${eventId} as failed:`,
+            statusError
+          );
         }
       }
 
-      let handlerFailed = false;
-      try {
-        if (handlers.has(topic)) {
-          const topicHandlers = handlers.get(topic);
-          for (const handler of topicHandlers) {
-            try {
-              await handler(message, rawMessage);
-            } catch (error) {
-              handlerFailed = true;
-              logger.error(`Handler error for ${topic}:`, error);
-              await this.storeDeadLetter(topic, rawMessage, error);
-            }
-          }
-        }
+      return {
+        success: false,
+        eventId,
+        error,
+      };
+    }
+  }
 
-        if (this._eventBus) {
-          const eventType = topic.replace(/\./g, '_').toUpperCase();
-          try {
-            if (message && typeof message === 'object' && message.metadata) {
-              // Object form reuses the original event id so the in-process
-              // EventBus deduplication window applies to redelivered messages.
-              await this._eventBus.publish(message, {
-                adapters: [],
-                source: `kafka:${groupId}`,
-              });
-            } else {
-              await this._eventBus.publish(eventType, message, {
-                adapters: [],
-                source: `kafka:${groupId}`,
-              });
-            }
-          } catch (error) {
-            handlerFailed = true;
-            logger.error(`EventBus publish error for ${topic}:`, error);
-          }
-        }
-      } catch (err) {
-        handlerFailed = true;
-        logger.error(`Unexpected handler error for ${topic}:`, err);
-      } finally {
-        // Two-phase claim resolution for side-effect topics: only a fully
-        // succeeded handler run (and EventBus fan-out) marks the event
-        // 'completed'. Any failure leaves it 'failed' so the next delivery can
-        // re-claim and retry it (issue #11192).
-        if (claimedEventId) {
-          if (handlerFailed) {
-            await processedEventRepository.markFailed(topic, claimedEventId, groupId);
-          } else {
-            const completed = await processedEventRepository.markCompleted(topic, claimedEventId, groupId);
-            if (completed === false) {
-              logger.warn(`[OrderConsumer] Claim for event ${claimedEventId} on ${topic} was superseded or expired before completion`);
-            }
-          }
-        }
-      }
+  async startConsuming(groupId) {
+    await kafka.getConsumer(groupId);
+
+    const messageHandler = async (
+      topic,
+      message,
+      rawMessage
+    ) => {
+      await this.processMessage(
+        topic,
+        message,
+        rawMessage,
+        groupId
+      );
     };
 
     await kafka.consumeMessages(
       groupId,
       messageHandler,
       async (error, topic, message) => {
-        logger.error(`Dead letter: ${topic}`, { error: error.message });
-        await this.storeDeadLetter(topic, message, error);
+        logger.error(
+          `Dead letter: ${topic}`,
+          {
+            error: error?.message,
+          }
+        );
+
+        await this.safeStoreDeadLetter(
+          topic,
+          message,
+          error
+        );
       }
     );
   }
 
-  async storeDeadLetter(topic, message, error) {
+  async storeDeadLetter(
+    topic,
+    message,
+    error
+  ) {
     const rawValue = message?.value;
-    const serialized = Buffer.isBuffer(rawValue)
-      ? rawValue.toString()
-      : rawValue != null
-        ? String(rawValue)
-        : null;
+
+    const serialized =
+      Buffer.isBuffer(rawValue)
+        ? rawValue.toString()
+        : rawValue != null
+          ? String(rawValue)
+          : null;
 
     const dlqEntry = {
       topic,
       message: serialized,
-      error: error.message,
+      error: error?.message || String(error),
       timestamp: new Date().toISOString(),
       retryCount: 0,
     };
 
-    const stored = await deadLetterRepository.store({
-      topic,
-      message: dlqEntry,
-      error: error.message,
-      retryCount: 0,
-    });
+    const stored =
+      await deadLetterRepository.store({
+        topic,
+        message: dlqEntry,
+        error: error?.message || String(error),
+        retryCount: 0,
+      });
 
     if (stored) {
-      logger.info(`📦 Dead letter persisted for ${topic} (id: ${stored.id})`);
+      logger.info(
+        `📦 Dead letter persisted for ${topic} (id: ${stored.id})`
+      );
     } else {
-      logger.error(`📦 Dead letter for ${topic} could NOT be persisted — message dropped`, dlqEntry);
+      logger.error(
+        `📦 Dead letter for ${topic} could NOT be persisted — message dropped`,
+        dlqEntry
+      );
     }
+
+    return stored;
   }
 
-  async replayDeadLetters({ topic = null, limit = 50, consumerGroup = CONSUMER_GROUPS.ORDER_SERVICE } = {}) {
-    const pending = await deadLetterRepository.listPending({ topic, limit });
-    const results = { attempted: pending.length, succeeded: 0, failed: 0 };
-    const groupId = consumerGroup || CONSUMER_GROUPS.ORDER_SERVICE;
+  /**
+   * Parse original message from DLQ.
+   */
+  parseDeadLetterMessage(entry) {
+    const serialized =
+      typeof entry.message === 'string'
+        ? entry.message
+        : entry.message?.message;
+
+    if (!serialized) {
+      throw new Error(
+        `Dead letter ${entry.id} contains no original message`
+      );
+    }
+
+    return JSON.parse(serialized);
+  }
+
+  async replayDeadLetters({
+    topic = null,
+    limit = 50,
+    consumerGroup = CONSUMER_GROUPS.ORDER_SERVICE,
+  } = {}) {
+    const pending =
+      await deadLetterRepository.listPending({
+        topic,
+        limit,
+      });
+
+    const results = {
+      attempted: pending.length,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+    };
+
+    const groupId =
+      consumerGroup ||
+      CONSUMER_GROUPS.ORDER_SERVICE;
 
     for (const entry of pending) {
       const currentTopic = entry.topic;
-      const topicHandlers = this.handlers.get(currentTopic) || [];
 
-      // entry.message is the DLQ wrapper object
-      // ({ topic, message, error, timestamp, retryCount }); its `message` field
-      // holds the JSON-encoded original Kafka value. Handlers are registered
-      // for the original event shape, so replay must feed them the parsed
-      // event, not the wrapper.
       let parsedMessage;
+
+      /**
+       * STEP 1:
+       * Parse DLQ payload.
+       */
       try {
-        const serialized = typeof entry.message === 'string'
-          ? entry.message
-          : entry.message?.message;
-        parsedMessage = JSON.parse(serialized);
+        parsedMessage =
+          this.parseDeadLetterMessage(entry);
       } catch (error) {
-        logger.error(`Replay failed for dead letter ${entry.id} (${currentTopic}): message is not valid JSON:`, error);
-        if ((entry.retry_count ?? 0) >= MAX_REPLAY_ATTEMPTS) {
-          await deadLetterRepository.markStatus(entry.id, 'failed');
-          logger.error(`Dead letter ${entry.id} (${currentTopic}) marked failed after ${entry.retry_count ?? 0} retries`);
-        } else {
-          await deadLetterRepository.markStatus(entry.id, 'pending', { incrementRetry: true });
-        }
-        results.failed += 1;
+        logger.error(
+          `Replay failed for dead letter ${entry.id}: invalid JSON`,
+          error
+        );
+
+        await this.handleReplayFailure(
+          entry,
+          error,
+          results
+        );
+
         continue;
       }
 
-      // Order read-model topics: apply the event atomically via orderReadModel.
-      // If the event was already applied, applyEvent returns false and we skip only
-      // the projection. In either case we proceed to run registered handlers so failed
-      // handlers can be recovered upon replay.
-      if (ORDER_READ_MODEL_TOPICS.has(currentTopic)) {
-        const eventId = parsedMessage?.eventId || parsedMessage?.metadata?.eventId || null;
-        const orderId = parsedMessage?.aggregateId || parsedMessage?.orderId || parsedMessage?.payload?.orderId || null;
-
-        let applied = false;
+      /**
+       * STEP 2:
+       * READ MODEL
+       *
+       * Same behavior as normal Kafka processing.
+       */
+      if (
+        ORDER_READ_MODEL_TOPICS.has(
+          currentTopic
+        )
+      ) {
         try {
-          applied = await orderReadModel.applyEvent({
-            topic: currentTopic,
-            eventId,
-            orderId,
-            eventType: parsedMessage?.eventType,
-            payload: parsedMessage?.payload,
-            version: parsedMessage?.version,
-            consumerGroup: groupId,
-          });
-        } catch (error) {
-          logger.error(`Replay read-model applyEvent error for dead letter ${entry.id} (${currentTopic}):`, error);
-          if ((entry.retry_count ?? 0) >= MAX_REPLAY_ATTEMPTS) {
-            await deadLetterRepository.markStatus(entry.id, 'failed');
-          } else {
-            await deadLetterRepository.markStatus(entry.id, 'pending', { incrementRetry: true });
-          }
-          results.failed += 1;
-          continue;
-        }
+          const applied =
+            await this.applyOrderReadModel(
+              currentTopic,
+              parsedMessage,
+              {
+                value: parsedMessage,
+              },
+              groupId
+            );
 
-        if (!applied) {
-          logger.info(`[OrderConsumer] Read-model projection already applied for event ${eventId} on ${currentTopic}; continuing to registered handlers`);
-        }
+          if (!applied) {
+            results.skipped += 1;
 
-        // Run registered handlers
-        try {
-          for (const handler of topicHandlers) {
-            await handler(parsedMessage, { value: parsedMessage });
+            logger.info(
+              `[OrderConsumer] Read-model event already applied during replay for DLQ ${entry.id}`
+            );
           }
-          await deadLetterRepository.markStatus(entry.id, 'replayed');
+
+          await deadLetterRepository.markStatus(
+            entry.id,
+            'replayed'
+          );
+
           results.succeeded += 1;
         } catch (error) {
-          logger.error(`Replay failed for dead letter ${entry.id} (${currentTopic}):`, error);
-          if ((entry.retry_count ?? 0) >= MAX_REPLAY_ATTEMPTS) {
-            await deadLetterRepository.markStatus(entry.id, 'failed');
-            logger.error(`Dead letter ${entry.id} (${currentTopic}) marked failed after ${entry.retry_count ?? 0} retries`);
-          } else {
-            await deadLetterRepository.markStatus(entry.id, 'pending', { incrementRetry: true });
-          }
-          results.failed += 1;
+          logger.error(
+            `Read-model replay failed for DLQ ${entry.id}:`,
+            error
+          );
+
+          await this.handleReplayFailure(
+            entry,
+            error,
+            results
+          );
         }
+
         continue;
       }
 
-      // Side-effect topics (payment.confirmed, escrow.released, notifications, etc.):
-      // Claim processing first so a replayed dead letter never re-applies side effects
-      // if it was already completed (Issue #11218).
-      const eventId = parsedMessage?.metadata?.eventId || parsedMessage?.eventId || null;
-      const orderId = parsedMessage?.orderId || parsedMessage?.payload?.orderId || parsedMessage?.aggregateId || null;
+      /**
+       * STEP 3:
+       * SIDE EFFECT REPLAY
+       */
+      const eventId =
+        this.getEventId(parsedMessage);
 
-      let claimedEventId = null;
-      if (eventId) {
-        let isNew = false;
-        try {
-          isNew = await processedEventRepository.claimProcessing(
+      const orderId =
+        this.getOrderId(parsedMessage);
+
+      if (!eventId) {
+        const error = new Error(
+          `Missing eventId during replay for ${currentTopic}`
+        );
+
+        await this.handleReplayFailure(
+          entry,
+          error,
+          results
+        );
+
+        continue;
+      }
+
+      let claimed = false;
+
+      try {
+        claimed =
+          await processedEventRepository.claimProcessing(
             currentTopic,
             eventId,
             orderId,
             groupId
           );
-        } catch (error) {
-          logger.error(`Failed to claim processing during replay for dead letter ${entry.id} (${currentTopic}):`, error);
-          if ((entry.retry_count ?? 0) >= MAX_REPLAY_ATTEMPTS) {
-            await deadLetterRepository.markStatus(entry.id, 'failed');
-          } else {
-            await deadLetterRepository.markStatus(entry.id, 'pending', { incrementRetry: true });
-          }
-          results.failed += 1;
-          continue;
-        }
 
-        if (!isNew) {
-          // Event was not newly claimed. Check if it already successfully completed.
-          const status = typeof processedEventRepository.getStatus === 'function'
-            ? await processedEventRepository.getStatus(currentTopic, eventId, groupId)
-            : 'completed';
+        if (!claimed) {
+          /**
+           * Check whether it was already completed.
+           */
+          let status = 'completed';
+
+          if (
+            typeof processedEventRepository.getStatus ===
+            'function'
+          ) {
+            status =
+              await processedEventRepository.getStatus(
+                currentTopic,
+                eventId,
+                groupId
+              );
+          }
 
           if (status === 'completed') {
-            logger.info(
-              `[OrderConsumer] Skipping replay for already-completed side-effect event ${eventId} on ${currentTopic}; marking DLQ entry replayed.`
+            await deadLetterRepository.markStatus(
+              entry.id,
+              'replayed'
             );
-            await deadLetterRepository.markStatus(entry.id, 'replayed');
+
             results.succeeded += 1;
+            results.skipped += 1;
+
+            logger.info(
+              `[OrderConsumer] Event ${eventId} already completed; DLQ ${entry.id} marked replayed`
+            );
+
             continue;
           }
 
-          // If status is 'processing', another replica or consumer currently holds an active lock/claim.
-          // Leave it in DLQ as pending so the in-flight worker can finish, without prematurely marking replayed.
+          /**
+           * Another worker currently owns it.
+           */
           logger.warn(
-            `[OrderConsumer] Dead letter ${entry.id} (${currentTopic}, event ${eventId}) is actively being processed by another worker; skipping for retry.`
+            `[OrderConsumer] Event ${eventId} is currently being processed by another worker`
           );
-          results.failed += 1;
+
+          results.skipped += 1;
+
           continue;
         }
 
-        claimedEventId = eventId;
-      }
+        /**
+         * IMPORTANT:
+         * Replay BOTH direct handlers AND EventBus.
+         *
+         * This fixes the original EventBus-loss bug.
+         */
+        await this.executeHandlers(
+          currentTopic,
+          parsedMessage,
+          {
+            value: parsedMessage,
+          }
+        );
 
-      let handlerFailed = false;
-      try {
-        for (const handler of topicHandlers) {
-          await handler(parsedMessage, { value: parsedMessage });
+        await this.publishToEventBus(
+          currentTopic,
+          parsedMessage,
+          groupId
+        );
+
+        /**
+         * Resolve idempotency FIRST.
+         */
+        const completed =
+          await processedEventRepository.markCompleted(
+            currentTopic,
+            eventId,
+            groupId
+          );
+
+        if (completed === false) {
+          throw new Error(
+            `Processing claim expired or was superseded for event ${eventId}`
+          );
         }
-        await deadLetterRepository.markStatus(entry.id, 'replayed');
+
+        /**
+         * Only NOW mark DLQ replayed.
+         */
+        await deadLetterRepository.markStatus(
+          entry.id,
+          'replayed'
+        );
+
         results.succeeded += 1;
       } catch (error) {
-        handlerFailed = true;
-        logger.error(`Replay failed for dead letter ${entry.id} (${currentTopic}):`, error);
-        if ((entry.retry_count ?? 0) >= MAX_REPLAY_ATTEMPTS) {
-          await deadLetterRepository.markStatus(entry.id, 'failed');
-          logger.error(`Dead letter ${entry.id} (${currentTopic}) marked failed after ${entry.retry_count ?? 0} retries`);
-        } else {
-          await deadLetterRepository.markStatus(entry.id, 'pending', { incrementRetry: true });
-        }
-        results.failed += 1;
-      } finally {
-        if (claimedEventId) {
+        logger.error(
+          `Replay failed for dead letter ${entry.id} (${currentTopic}):`,
+          error
+        );
+
+        /**
+         * Mark claim failed so a later attempt can reclaim it.
+         */
+        if (claimed) {
           try {
-            if (handlerFailed) {
-              await processedEventRepository.markFailed(currentTopic, claimedEventId, groupId);
-            } else {
-              const completed = await processedEventRepository.markCompleted(currentTopic, claimedEventId, groupId);
-              if (completed === false) {
-                logger.warn(`[OrderConsumer] Claim for event ${claimedEventId} on ${currentTopic} was superseded or expired before replay completion`);
-              }
-            }
-          } catch (error) {
-            logger.error(`Failed to resolve processing claim during replay for event ${claimedEventId} on ${currentTopic}:`, error);
+            await processedEventRepository.markFailed(
+              currentTopic,
+              eventId,
+              groupId
+            );
+          } catch (statusError) {
+            logger.error(
+              `Failed to mark replay claim failed for ${eventId}:`,
+              statusError
+            );
           }
         }
+
+        await this.handleReplayFailure(
+          entry,
+          error,
+          results
+        );
       }
     }
 
-    logger.info(`♻️ Dead letter replay complete`, results);
+    logger.info(
+      `♻️ Dead letter replay complete`,
+      results
+    );
+
     return results;
+  }
+
+  async handleReplayFailure(
+    entry,
+    error,
+    results
+  ) {
+    const retryCount =
+      entry.retry_count ?? 0;
+
+    try {
+      if (retryCount >= MAX_REPLAY_ATTEMPTS) {
+        await deadLetterRepository.markStatus(
+          entry.id,
+          'failed'
+        );
+
+        logger.error(
+          `Dead letter ${entry.id} marked failed after ${retryCount} retries`
+        );
+      } else {
+        await deadLetterRepository.markStatus(
+          entry.id,
+          'pending',
+          {
+            incrementRetry: true,
+          }
+        );
+      }
+    } catch (statusError) {
+      logger.error(
+        `Failed to update DLQ status for ${entry.id}:`,
+        statusError
+      );
+    }
+
+    results.failed += 1;
   }
 
   async startAllConsumers() {
     await this.initialize();
 
-    // Only start consumer groups that were actually created in initialize().
-    // CONSUMER_GROUPS also declares DRIVER/PAYMENT/ESCROW groups that are not
-    // wired up yet, and startConsuming() would fail on getConsumer() for them.
-    const consumerGroups = this.createdConsumerGroups;
-    for (const groupId of consumerGroups) {
+    /**
+     * Only start groups actually created above.
+     */
+    for (const groupId of this.createdConsumerGroups) {
       try {
         await this.startConsuming(groupId);
-        logger.info(`✅ Consumer ${groupId} started`);
+
+        logger.info(
+          `✅ Consumer ${groupId} started`
+        );
       } catch (error) {
-        logger.error(`❌ Failed to start consumer ${groupId}:`, error);
+        logger.error(
+          `❌ Failed to start consumer ${groupId}:`,
+          error
+        );
       }
     }
   }
@@ -447,11 +890,31 @@ class OrderConsumer {
 
 export default new OrderConsumer();
 
-// === Spec 31: ===
-// === Spec 31: idempotent dedup ===
 const TTL = 24 * 60 * 60;
-export async function markProcessed(redis, key) {
-  const r = await redis.set(`dedup:${key}`, '1', 'EX', TTL, 'NX');
-  return r === 'OK';
-}
 
+export async function markProcessed(
+  redis,
+  key
+) {
+  if (!redis) {
+    throw new Error(
+      'Redis instance is required'
+    );
+  }
+
+  if (!key) {
+    throw new Error(
+      'Deduplication key is required'
+    );
+  }
+
+  const result = await redis.set(
+    `dedup:${key}`,
+    '1',
+    'EX',
+    TTL,
+    'NX'
+  );
+
+  return result === 'OK';
+}
